@@ -3,11 +3,22 @@ import wave
 import numpy as np
 from pathlib import Path
 import os
+import sys
 import re
 import difflib
 import torch
 import torchaudio
 from transformers import WhisperProcessor, WhisperForConditionalGeneration, pipeline
+import warnings
+
+warnings.filterwarnings('ignore')
+
+os.environ["TORCH_AUDIO_NO_WARNINGS"] = "1"
+os.environ["TRANSFORMERS_NO_ADVISORY_WARNINGS"] = "true"
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+from transformers.utils import logging
+logging.set_verbosity_error()
 
 # === Конвертация аудио в PCM ===
 def convert_to_pcm(input_file, output_file):
@@ -47,6 +58,19 @@ def is_mono_audio(file1, file2, tolerance=1e-3):
     diff = torch.mean(torch.abs(y1 - y2)).item()
     return corr > 0.995 and diff < tolerance
 
+# === Очистка от непонятных слов ===
+def is_foreign_or_gibberish(text):
+    latin_ratio = len(re.findall(r"[A-Za-zÀ-ž]", text)) / max(1, len(text))
+    repeat_ratio = len(re.findall(r"(\b\w+\b)(?:\s+\1){3,}", text)) > 0
+    return latin_ratio > 0.3 or repeat_ratio
+
+# === Заглавная буква в каждом начале диалога ===
+def capitalize_first_letter(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return text
+    return text[0].upper() + text[1:] if len(text) > 1 else text.upper()
+
 # === Очистка повторяющихся фраз по смыслу ===
 def clean_repeated_phrases(segments, similarity_threshold=0.85):
     cleaned = []
@@ -56,6 +80,9 @@ def clean_repeated_phrases(segments, similarity_threshold=0.85):
         new_sentences = []
         last_sentence = ""
         for s in sentences:
+            if is_foreign_or_gibberish(s):
+                continue
+
             sim = difflib.SequenceMatcher(None, last_sentence, s).ratio()
             if sim < similarity_threshold:
                 new_sentences.append(s)
@@ -69,6 +96,9 @@ def clean_repeated_phrases(segments, similarity_threshold=0.85):
         patterns = [
             r'\b(да|ага|угу|поняла|понял|ну|вот|это|сейчас|так|здравствуйте)\b(?:\s+\1\b){1,}',
             r'редактор\s*субтитр\w*\s*[аa]\.?[\s\w]*семкин',
+            r"субтитр\w*\s+созд\w*\s+dima ?torzok",
+            r"субтитр\w*\s+сдел\w*\s+dima ?torzok",
+            r"субтитр\w*\s+дел\w*\s+dima ?torzok",
             r'корректор\s*[аa]\.?[\s\w]*егоров',
             r'продолжение следует',
             r'звонок в дверь',
@@ -88,6 +118,10 @@ def clean_repeated_phrases(segments, similarity_threshold=0.85):
                 cleaned_text = cleaned_text.replace(tail, "", cleaned_text.count(tail) - 1).strip()
 
         if cleaned_text:
+            sentences = re.split(r'(?<=[.!?])\s+', cleaned_text)
+            sentences = [s.strip() + '.' if not re.search(r'[.!?]$', s) else s for s in sentences]
+            cleaned_text = ' '.join(sentences)
+
             cleaned.append((start, end, speaker, cleaned_text))
     return cleaned
 
@@ -174,7 +208,15 @@ if __name__ == "__main__":
         generate_kwargs={"temperature":0.0,"no_repeat_ngram_size":4}
     )
 
-    for txt_file in input_root.rglob("*.txt"):
+    txt_files = list(input_root.rglob("*.txt"))
+    total_files = len(txt_files)
+    print(f'\nНайдено {total_files} текстовых файлов для обработки.\n')
+
+    for idx,txt_file in enumerate(txt_files, start=1):
+        progress = int((idx / total_files) * 30)
+        bar = "█" * progress + "-" * (30 - progress)
+        sys.stdout.write(f"\r[{bar}] {idx}/{total_files}  {txt_file.name[:40]:<40}")
+        sys.stdout.flush()
         base_name = txt_file.stem
         audio_path = None
         for ext in [".wav", ".mp3", ".flac"]:
@@ -219,11 +261,14 @@ if __name__ == "__main__":
         with open(dialogue_path, "w", encoding="utf-8") as f:
             f.write(f"Дата: {meta['date']}\nВремя: {meta['time']}\nАбонент: {meta['abonent']}\nКонтакт: {meta['contact']}\n\n")
             for _, _, speaker, text in all_segments:
+                # text = text.strip()
+                text = capitalize_first_letter(text)
                 f.write(f"{speaker}: {text}\n")
 
         with open(category_summary_path, "a", encoding="utf-8") as f:
             f.write(f"\nДата: {meta['date']}\nВремя: {meta['time']}\nАбонент: {meta['abonent']}\nКонтакт: {meta['contact']}\n\n")
             for _, _, speaker, text in all_segments:
+                text = capitalize_first_letter(text)
                 f.write(f"{speaker}: {text}\n")
             f.write("="*80 + "\n")
 
@@ -231,7 +276,9 @@ if __name__ == "__main__":
         with open(contact_summary_path, 'a', encoding='utf-8') as f:
             f.write(f"\nДата: {meta['date']}\nВремя: {meta['time']}\nАбонент: {meta['abonent']}\nКонтакт: {meta['contact']}\n\n")
             for _, _, speaker, text in all_segments:
+                text = capitalize_first_letter(text)
                 f.write(f"{speaker}: {text}\n")
             f.write("\n" + '-'*100 + "\n" + "="*80 + "\n")
+    print('\n')
 
     print("\n📘 Все транскрипции сохранены по номерам и категориям.")
